@@ -3,20 +3,90 @@ var gutil = require('gulp-util');
 var http = require('http');
 var https = require('https');
 var connect = require('connect');
-var serveStatic = require('serve-static');
 var connectLivereload = require('connect-livereload');
 var proxy = require('proxy-middleware');
 var tinyLr = require('tiny-lr');
-var watch = require('watch');
 var fs = require('fs');
-var serveIndex = require('serve-index');
 var path = require('path');
 var open = require('open');
 var url = require('url');
 var extend = require('node.extend');
 var enableMiddlewareShorthand = require('./enableMiddlewareShorthand');
 var isarray = require('isarray');
+var mime = require('mime');
+var prettyBytes = require('pretty-bytes');
+var compression = require('compression');
 
+function directoryListing(files) {
+  var types = {
+    eot: 'Fonts',
+    woff: 'Fonts',
+    ttf: 'Fonts',
+    otf: 'Fonts',
+    svg: 'Fonts',
+    png: 'Images',
+    jpg: 'Images',
+    css: 'CSS',
+    js: 'JavaScript',
+    map: 'Sourcemaps'
+  };
+
+  function getType(p) {
+    return types[path.extname(p).substring(1)] || 'Others';
+  }
+
+  function sortF(a, b) {
+    var ext = getType(a).localeCompare(getType(b));
+    if (ext !== 0) return ext;
+    var dir = path.dirname(a).localeCompare(path.dirname(b));
+    if (dir !== 0) return dir;
+    return a.localeCompare(b);
+  }
+
+  return function(req, res, next) {
+    if (req.url != '/') return next();
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.write('<html style="font-family: \'open sans\', \'source sans pro\', sans-serif; font-size: 14px; line-height: 20px; padding: 0 5% 5%"><div>');
+    var lastType = null;
+    var lastDir = null;
+    Object.keys(files).sort(sortF).forEach(function(p) {
+      var type = getType(p);
+      var dir = path.dirname(p);
+      var base = path.basename(p);
+      if (type !== lastType) {
+        res.write('</div><div style="display: inline-block; vertical-align: top; width: 23%; margin: 0 1%"><h2>' + type + '</h2>');
+        lastType = type;
+        lastDir = null;
+      }
+      if (dir !== lastDir) {
+        res.write('<h4>' + dir + '</h4>');
+        lastDir = dir;
+      }
+      res.write('<div style="margin-left: 5%; position: relative;"><a style="text-decoration:none" href="' + p + '">' + base + '</a> <span style="color: #999; font-size: 12px; position: absolute; right: 0; top: 2px">' + prettyBytes(files[p].contents.toString().length) + '</span></div>');
+    });
+    res.write('</div></html>');
+    res.end();
+  };
+}
+
+function serveStream(files) {
+  return function(req, res) {
+    var p = url.parse(req.url).pathname;
+    if (!files[p]) {
+      gutil.log(gutil.colors.red('Not found'), gutil.colors.cyan(p));
+      res.statusCode = 404;
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.write('Not found');
+      res.end();
+      return;
+    }
+    var body = files[p].contents;
+    res.setHeader('Content-Type', mime.lookup(p) + '; charset=utf-8');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.write(body);
+    res.end();
+  };
+}
 
 module.exports = function(options) {
 
@@ -30,7 +100,6 @@ module.exports = function(options) {
 
     host: 'localhost',
     port: 8000,
-    fallback: false,
     https: false,
     open: false,
 
@@ -68,6 +137,12 @@ module.exports = function(options) {
       options: undefined
     },
 
+    // Middleware: Compression
+    compression: {
+      enable: false,
+      options: undefined
+    },
+
     // Middleware: Proxy
     // For possible options, see:
     //  https://github.com/andrewrk/connect-proxy
@@ -79,7 +154,8 @@ module.exports = function(options) {
   // Allow shorthand syntax, using the enable property as a flag
   var config = enableMiddlewareShorthand(defaults, options, [
     'directoryListing',
-    'livereload'
+    'livereload',
+    'compression'
   ]);
 
   if (typeof config.open === 'string' && config.open.length > 0 && config.open.indexOf('http') !== 0) {
@@ -148,49 +224,37 @@ module.exports = function(options) {
     app.use(config.proxies[i].source, proxy(proxyoptions));
   }
 
+  var files = {};
+
   if (config.directoryListing.enable) {
-    app.use(serveIndex(path.resolve(config.directoryListing.path), config.directoryListing.options));
+    app.use(directoryListing(files));
   }
 
+  if (config.compression.enable) {
+    app.use(compression(config.compression.options));
+  }
 
-  var files = [];
+  app.use(serveStream(files));
 
   // Create server
   var stream = through.obj(function(file, enc, callback) {
+    if (file.isStream()) {
+      return callback(new Error('Streams are not supported'));
+    }
 
-    app.use(serveStatic(file.path));
+    var url = '/' + path.relative(file.base, file.path);
+    files[url] = file;
 
     if (config.livereload.enable) {
-      var watchOptions = {
-        ignoreDotFiles: true,
-        filter: config.livereload.filter
-      };
-      watch.watchTree(file.path, watchOptions, function (filename) {
-        lrServer.changed({
-          body: {
-            files: filename
-          }
-        });
-
+      lrServer && lrServer.changed({
+        body: {
+          files: file.path
+        }
       });
     }
 
     this.push(file);
     callback();
-  })
-  .on('data', function(f){files.push(f);})
-  .on('end', function(){
-    if (config.fallback) {
-      files.forEach(function(file){
-        var fallbackFile = file.path + '/' + config.fallback;
-        if (fs.existsSync(fallbackFile)) {
-          app.use(function(req, res) {
-            res.setHeader('Content-Type', 'text/html; charset=UTF-8');
-            fs.createReadStream(fallbackFile).pipe(res);
-          });
-        }
-      });
-    }
   });
 
   var webserver;
